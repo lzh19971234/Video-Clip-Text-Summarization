@@ -1,0 +1,68 @@
+syntax = "proto3";
+package kuaishou.ad.creative.center.algorithm;
+option java_package = "com.kuaishou.ad.creative.center.algorithm";
+option java_outer_classname = "VideoAsr";
+option java_multiple_files = true;
+
+message VideoAsrRequest {
+  uint64 live_stream_id = 1;
+  uint64 start_time = 2;
+  uint64 end_time = 3;
+  bool get_text = 4;
+}
+
+message VideoAsrResponse {
+  string result = 1;
+  repeated string text = 2;
+}
+
+service GetVideoAsrService {
+  rpc GetVideoAsr(VideoAsrRequest) returns (VideoAsrResponse);
+}
+
+message LiveClipAlgRequest {
+  uint64 live_stream_id = 1;
+  uint64 start_time = 2;
+  uint64 end_time = 3;
+  AlgClipType clip_type = 4;
+  map<string,string> parameters = 5;
+}
+
+enum AlgClipType {
+  WORD_COUNTS_CLIP = 0;
+  TEXTRANK_CLIP = 1;
+  BAGGING_CLIP = 2;
+  BERT_GRAPH_CLIP = 3;
+}
+
+message LiveClipAlgResponse {
+  string resource_key = 1;
+  uint64 video_height = 2;
+  uint64 video_width = 3;
+  uint64 video_duration = 4;
+  map<string,string> parameters = 5;
+}
+
+message SentItemReq {
+  float start_time = 1;
+  float end_time = 2;
+  string sent_asr = 3;
+}
+
+message SentItemRes {
+  float start_time = 1;
+  float end_time = 2;
+  string sent_asr = 3;
+  float score = 4;
+}
+
+message LiveClipSentSelectRequest {
+  repeated SentItemReq req_items = 1;
+  map<string,string> parameters = 2;
+}
+
+message LiveClipSentSelectResponse {
+  repeated SentItemRes res_items = 1;
+  map<string,string> parameters = 2;
+}
+

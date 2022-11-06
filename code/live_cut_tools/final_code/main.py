@@ -1,0 +1,326 @@
+#!/usr/bin/env python
+import datetime
+import cv2
+import numpy as np
+import proto.get_cutting_pb2
+import proto.get_cutting_pb2_grpc
+import yaml
+from infra.kafka import KafkaProducers
+from transformers import BertTokenizer,BertModel
+from proto.get_cutting_pb2 import LiveClipAlgRequest
+from proto.get_cutting_pb2 import AlgClipType
+
+from cutting_algorithm.v1 import getstarted
+from cutting_algorithm.v2 import get_summary
+from cutting_algorithm.v3 import get_v3_summary
+from cutting_algorithm.v4 import get_v4_summary
+from get_asr import getasr
+from get_asr import getsrt
+from get_asr import getres
+import logging
+from storage import (
+    BlobStore,
+    BlobStoreError,
+    MARK_FAKE_DELETE,
+    MARK_NORMAL,
+    close_bloblstore_resource,
+)
+import os
+import subprocess
+from infra.kafka import (
+    ConsumerParameter,
+    KsKafkaConsumer,
+    MessageContext,
+    FinishConsumeException
+)
+
+logger = logging.getLogger("mainlogger")
+
+def get_model():
+    tokenizer = BertTokenizer.from_pretrained('bert')
+    model = BertModel.from_pretrained('bert')
+    return tokenizer, model
+
+def get_video(url):
+    # 构建 BlobStore 资源对象
+    keys = url.split("_")
+    upload_test = BlobStore(keys[0], keys[1])
+
+    # get
+    # try:
+    value = upload_test.get(key=keys[2])
+    # except BlobStoreError as e:
+    #    logger.error(e)
+    # 程序退出前，请显示调用，释放 blobstore 资源
+    # close_bloblstore_resource()
+    return value
+
+
+def get_word_embeddings():
+    with open('./word/sgns.sogou.char', encoding='utf-8') as f:
+        lines = f.readlines()
+        word_embeddings = {}
+        for _, line in enumerate(lines):
+            if _ != 0:
+                values = line.split()
+                word = values[0]
+                coefs = np.asarray(values[1:], dtype='float32')
+                word_embeddings[word] = coefs
+    return word_embeddings
+
+
+# 获取当前时间
+def get_time():
+    time = str(datetime.datetime.now().strftime('%y-%m-%d %H:%M:%S'))
+    return time
+
+
+# 获取视频时长
+def get_video_duration(video_path: str):
+    ext = os.path.splitext(video_path)[-1]
+    if ext != '.mp4' and ext != '.avi' and ext != '.flv':
+        raise Exception('format not support')
+    ffprobe_cmd = 'ffprobe -i {} -show_entries format=duration -v quiet -of csv="p=0"'
+    p = subprocess.Popen(
+        ffprobe_cmd.format(video_path),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=True)
+    out, err = p.communicate()
+    duration_info = float(str(out, 'utf-8').strip())
+    return duration_info
+
+
+# 获取视频长宽
+def get_lw(video_name):
+    vcap = cv2.VideoCapture(video_name)  # 0=camera
+    if vcap.isOpened():
+        width = vcap.get(cv2.CAP_PROP_FRAME_WIDTH)  # float
+        height = vcap.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float
+        # print(cv2.CAP_PROP_FRAME_WIDTH, cv2.CAP_PROP_FRAME_HEIGHT) # 3, 4
+
+        # or
+        width = int(vcap.get(3))  # float
+        height = int(vcap.get(4))  # float
+        return [height, width]
+
+
+# 解析config文件
+def get_yaml_data(yaml_file):
+    # 打开yaml文件
+    file = open(yaml_file, 'r', encoding="utf-8")
+    file_data = file.read()
+    file.close()
+    # 将字符串转化为字典或列表
+    data = yaml.load(file_data, Loader=yaml.FullLoader)
+    return data
+
+
+def write_binary(binary, name):
+    with open(name, 'wb') as f:
+        f.write(binary)
+    f.close()
+
+
+def setup_logger():
+    fmt_str = ('%(asctime)s.%(msecs)03d %(levelname)7s '
+               '[%(thread)d][%(process)d] %(message)s')
+    fmt = logging.Formatter(fmt_str, datefmt='%H:%M:%S')
+    handler = logging.FileHandler('./log/main.log', encoding='utf-8')
+    handler.setFormatter(fmt)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+
+class GetCut(object):
+    def __init__(self, times, aasr, merge, interval, retain, word_embeddings, tokenize, model):
+        self.times = times
+        self.aasr = aasr
+        self.merge = merge
+        self.interval = interval
+        self.retain = retain
+        self.word_embeddings = word_embeddings
+        self.tokenize = tokenize
+        self.model = model
+
+    def cutting(self, live_id, start_time, end_time, typ):
+        # stage 1: 先拿视频和ASR结果
+        text_name, url = getasr(live_id, start_time, end_time, self.merge, self.aasr, self.interval)
+        getsrt(text_name)
+        value = get_video(url)
+        write_binary(value, str(live_id) + ".mp4")
+
+        # stage 2: 开始剪辑
+        if typ == AlgClipType.WORD_COUNTS_CLIP:
+            # get v1 result
+            logger.info('start v1')
+            getsrt(text_name)
+            video_name = getstarted(str(live_id) + ".mp4", text_name + ".srt", self.times)
+            logger.info('v1 finish')
+        elif typ == AlgClipType.TEXTRANK_CLIP:
+            # get v2 result
+            logger.info('start v2')
+            video_name = get_summary(str(live_id) + ".mp4", text_name + ".txt", self.retain, self.times,
+                                     self.word_embeddings)
+            logger.info('v2 finish')
+        elif typ == AlgClipType.BAGGING_CLIP:
+            # get v3 result
+            logger.info('start v3')
+            video_name = get_v3_summary(str(live_id) + ".mp4", text_name + ".txt", self.retain, self.times)
+            logger.info('v3 finish')
+        elif typ == AlgClipType.BERT_GRAPH_CLIP:
+            # get v4 result
+            logger.info('start v4')
+            video_name = get_v4_summary(str(live_id) + ".mp4", text_name + ".txt", self.retain, self.times, self.tokenize, self.model)
+            logger.info("v4 finsih")
+        else:
+            return
+        logger.info(get_time())
+        # 删除视频与字幕文件
+        os.remove(str(live_id) + ".mp4")
+        os.remove(text_name + ".srt")
+        os.remove(text_name + ".txt")
+        # 存入blob
+        logger.info("store in blob")
+        key = self.store(video_name)
+        logger.info(get_time())
+        # 获取其他参数
+        logger.info("get other parameters")
+        duration = int(get_video_duration(video_name))
+        [height, width] = get_lw(video_name)
+        logger.info(get_time())
+        os.remove(video_name)
+        return [key, duration, height, width]
+
+    def store(self, video_name):
+        # 构建 BlobStore 资源对象
+        upload_test = BlobStore('ad', 'material-opt-tmp')
+        key = video_name
+        with open(video_name, 'rb') as f:
+            # save
+            try:
+                upload_test.save(key=key, value=f)
+            except BlobStoreError as e:
+                logger.info(e)
+
+        # get
+        # try:
+        #    value = upload_test.get(key = "ffasafafsasfasf.mp4")
+        # except BlobStoreError as e:
+        #    logger.error(e)
+        # 程序退出前，请显示调用，释放 blobstore 资源
+        # close_bloblstore_resource()
+        return "ad" + "_" + "material-opt-tmp" + '_' + key
+
+    # 继承infra组提供的抽象类KsKafkaConsumer，并实现consume函数即可。
+    # 业务线具体的消费逻辑在consume中完成，如TestNewConsumer:
+
+
+# 继承infra组提供的抽象类KsKafkaConsumer，并实现consume函数即可。
+# 业务线具体的消费逻辑在consume中完成，如TestNewConsumer:
+class TestNewConsumer(KsKafkaConsumer):
+    def __init__(self, parameter, times, aasr, merge, interval, retain, word_embeddings, tokenize, model):
+        super().__init__(parameter)
+        self.times = times
+        self.aasr = aasr
+        self.merge = merge
+        self.interval = interval
+        self.retain = retain
+        self.word_embeddings = word_embeddings
+        self.tokenize = tokenize
+        self.model = model
+
+    def consume(self, message: bytes, context: MessageContext):
+
+        logger.info(f'message: {message}, topic_name: {context.topic_name}, '
+                    f'partition: {context.partition}, '
+                    f'offset: {context.offset}')
+        logger.info('---------')
+        logger.info(get_time())
+        ####
+        # 获得request，调用tackle返回response
+        request = LiveClipAlgRequest()
+        request.ParseFromString(message)
+        tpc = "ad_material_industry_live_clip_algo_response"
+        response = self.tackle(request)
+        KafkaProducers.send(tpc, response)
+        ####
+        # raise FinishConsumeException()
+
+        if message == bytes('produce over', 'utf8'):
+            logger.info("consume over")
+            logger.info(get_time())
+            # 在消费逻辑中可以使用FinishConsumeException来终止消费，
+            # 该场景适用于group中只有一个consumer的情况
+            raise FinishConsumeException()
+
+    # 处理request剪辑, 并返回response
+    def tackle(self, request):
+        logger.info(f'request: {request}')
+        logger.info(get_time())
+        live_id = request.live_stream_id
+        start_time = request.start_time
+        end_time = request.end_time
+        typ = request.clip_type
+        parameters = request.parameters
+        cut = GetCut(self.times, self.aasr, self.merge, self.interval, self.retain, self.word_embeddings, self.tokenize, self.model)
+        try:
+            [key, duration, height, width] = cut.cutting(live_id, start_time, end_time, typ)
+        except Exception as e:
+            logger.exception(e)
+            logger.info(get_time())
+            res = str(getres(live_id, start_time, end_time, False)).split("text: ")
+            url = res[0].split('@')
+            key = url[0][9:] + '_' + url[1] + '_' + url[2][:-2]
+            height = 0
+            width = 0
+            duration = 0
+            os.remove(str(live_id) + ".mp4")
+            path = './'
+            path_list = os.listdir(path)
+            for filename in path_list:
+                if os.path.splitext(filename)[1] == ".txt" or os.path.splitext(filename)[1] == ".srt":
+                    os.remove(filename)
+
+
+        msg = proto.get_cutting_pb2.LiveClipAlgResponse(resource_key=key, video_height=height, video_width=width,
+                                                        video_duration=duration, parameters=parameters)
+        logger.info(f'response: {msg}')
+        logger.info(get_time())
+        return msg.SerializeToString()
+
+
+if __name__ == "__main__":
+    current_path = os.path.abspath("./config/")
+    yaml_path = os.path.join(current_path, "config.yaml")
+    data = get_yaml_data(yaml_path)
+    aasr = data['is_asr']
+    times = data['total_time']
+    merge = data['merge_second']
+    interval = data['interval_time']
+    retain = data['retain_ratio']
+    word_embeddings = get_word_embeddings()
+    tokenize, model = get_model()
+
+    setup_logger()
+    topic = 'ad_material_industry_live_clip_algo_request'
+    ##
+    group_id = 'ad_material_industry_live_clip'
+    ##
+
+    # 构建消费者
+    parameter = ConsumerParameter(topic, group_id, True)
+    consumer = TestNewConsumer(parameter, times, aasr, merge, interval, retain, word_embeddings, tokenize, model)
+
+    # def close_consume():
+    #    time.sleep(18)
+    #    consumer.close()
+
+    # 开启停止消费的线程
+    # threading.Thread(target=close_consume).start()
+
+    # 开始消费，注意：如果是python3.9+环境，请将block设置为True，否则将会报错。
+    # Python3.9之后对GC进行了优化：主线程退出之后，主线程内的资源将被回收。
+    # https://docs.python.org/3/whatsnew/3.9.html#gc
+    # consumer.start(block=True)
+    consumer.start()
